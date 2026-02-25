@@ -1,238 +1,186 @@
-# 🧭 Local-First RAG 構想〜PoC構築サマリー
+# local-first-rag
 
-## 🏁 プロジェクト概要
-**目的：**  
-個人〜小規模利用者（50名未満）を対象に、  
-外部サーバーへ機密文書を送らず「ローカルで完結するRAG（Retrieval-Augmented Generation）」を実現する。  
-生成は外部APIでも、検索・ベクトル化はローカル（WASM）で行う。
+Rails コードベースを、機密情報を外部送信せずにローカルで RAG 検索できる開発者向けツール。
 
-**理念：**
-> “Startpage.comのように、あなたのデータには興味がありません。”
+Tree-sitter による AST ベースのチャンキングと、ベクトル検索 + 全文検索のハイブリッド方式で、大規模 Rails リポジトリのコードを自然言語で検索する。
 
 ---
 
-## 1️⃣ 技術・構想フェーズ
+## 特徴
 
-| 項目 | 内容 |
+- **完全ローカル動作** — インデクシング・検索ともに外部 API 不使用。機密コードがネットワークを通じることはない
+- **Rails 特化チャンキング** — Tree-sitter（AST）でクラス・メソッド・DSL 行を正確に抽出。正規表現では対応困難なネストやヒアドキュメントも処理できる
+- **ハイブリッド検索** — ベクトル検索（sqlite-vec）と全文検索（FTS5）を RRF で統合。FTS5 が機能しない場合のデグレードにも対応
+- **差分インデクシング** — mtime + SHA1 の二段階検出により、変更ファイルのみを再処理。2 回目以降は数秒で完了
+- **複数プロジェクト対応** — `--port` オプションで複数インスタンスを起動し、ブラウザのタブで使い分ける
+- **git 連携** — インデクシング時に各ファイルの直近コミット情報を記録
+
+---
+
+## 動作の流れ
+
+```
+Rails リポジトリ
+      |
+   [CLI: pnpm index]
+      |
+  Tree-sitter でチャンキング
+  （クラス概要・メソッド・DSL / ERB / YAML / Gemfile）
+      |
+  multilingual-e5-base で埋め込み生成（768dim、完全ローカル）
+      |
+  SQLite に保存（sqlite-vec + FTS5）
+      |
+   [Server: pnpm serve]
+      |
+  ハイブリッド検索 API（ベクトル + FTS5 → RRF）
+      |
+   [Browser: pnpm dev]
+      |
+  React 検索 UI（コードスニペット・参照情報）
+```
+
+---
+
+## 必要な環境
+
+| 項目 | 要件 |
 |------|------|
-| コア思想 | 「Local-First」＋「Privacy-Preserving」＋「User-Owned Knowledge」 |
-| 構成パターン | A. 完全ローカル／B. ハイブリッド（採用）／C. 完全クラウド |
-| 採用方針 | 検索＝ローカル、生成＝外部API（※オプション） |
-| WebAssemblyの役割 | 埋め込み・検索・PDF処理をブラウザで完結 |
-| 代表的比較対象 | NotebookLM、Perplexity Pages、Rewind.ai、LlamaIndex.TS、AnythingLLM |
-| 埋め込み候補 | **Embedding Gemma**（Google Gemma 2b int8）＋ @xenova/transformers |
+| OS | macOS（主ターゲット） |
+| Node.js | v20 以上 |
+| pnpm | v10 以上 |
+| Xcode CLT | tree-sitter / sqlite-vec のネイティブ拡張ビルドに必要 |
+| ディスク空き容量 | 埋め込みモデル約 280MB + DB（プロジェクト規模に応じて） |
 
----
-
-## 2️⃣ アーキテクチャ設計
-
-### 🧩 構成図（概念）
-
-```
-PDF / TXT Upload
-     ↓
-Chunking（分割）
-     ↓
-Embedding (Gemma / WASM)
-     ↓
-Store in IndexedDB
-     ↓
-Query + Vector Search (cosine)
-     ↓
-Context Inject → (optional) API Generate
-     ↓
-UI Display (React / shadcn)
-```
-
-### 📁 提案リポジトリ構成
-```
-local-first-rag/
- ├─ src/
- │   ├─ components/
- │   ├─ features/
- │   │   ├─ embed/
- │   │   ├─ search/
- │   │   └─ ui/
- │   ├─ lib/
- │   └─ assets/
- ├─ public/
- ├─ tailwind.config.ts
- ├─ postcss.config.js
- ├─ vite.config.ts
- └─ tsconfig.json
-```
-
----
-
-## 3️⃣ 開発環境構築
-
-### 🧰 ベース環境
-- Node.js v20+
-- pnpm v10
-- React + TypeScript + Vite
-- Tailwind CSS v4（CLI分離版）
-- shadcn (new CLI)
-- @xenova/transformers (WASM埋め込み)
-
-### 📦 初期化手順
 ```bash
-pnpm create vite@latest local-first-rag -- --template react-ts
-pnpm add -D @tailwindcss/cli @tailwindcss/postcss postcss autoprefixer
-pnpm add -D prettier prettier-plugin-tailwindcss
-pnpm add class-variance-authority clsx tailwind-variants lucide-react
+# Xcode CLT のインストール（未導入の場合）
+xcode-select --install
 ```
 
 ---
 
-## 4️⃣ 設定ファイル一覧
+## インストール
 
-**tailwind.config.ts**
-```ts
-import type { Config } from "tailwindcss";
-export default {
-  content: ["./index.html", "./src/**/*.{ts,tsx,js,jsx}"],
-  theme: { extend: {} },
-  plugins: [],
-} satisfies Config;
-```
-
-**postcss.config.js**
-```js
-export default {
-  plugins: {
-    '@tailwindcss/postcss': {},
-  },
-};
-```
-
-**src/index.css**
-```css
-@import "tailwindcss";
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-@plugin "tailwindcss-animate";
-@custom-variant dark (&:is(.dark *));
-```
-
-**vite.config.ts**
-```ts
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-export default defineConfig({
-  plugins: [react()],
-  resolve: { alias: { '@': path.resolve(__dirname, 'src') } },
-})
-```
-
-**tsconfig.json**
-```json
-{
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": { "@/*": ["./src/*"] }
-  }
-}
-```
-
----
-
-## 5️⃣ UI構築（Tailwind + shadcn）
-
-### shadcn初期化
 ```bash
-pnpm dlx shadcn@latest init -y
-pnpm dlx shadcn@latest add button
+git clone <repository-url> local-first-rag
+cd local-first-rag
+pnpm install
 ```
 
-### src/App.tsx（UIテスト）
-```tsx
-import { Button } from "@/components/ui/button";
+`pnpm install` 中に tree-sitter・sqlite-vec のネイティブバイナリがビルドされる。
 
-export default function App() {
-  return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center">
-      <div className="space-y-4 text-center">
-        <h1 className="text-2xl font-semibold text-slate-800">
-          🎶 Local-First RAG + Tailwind v4 + shadcn
-        </h1>
-        <Button>Primary</Button>
-        <Button variant="ghost">Ghost</Button>
-      </div>
-    </div>
-  );
-}
+---
+
+## クイックスタート
+
+### 1. インデクシング
+
+```bash
+pnpm index /path/to/your-rails-app
 ```
 
-## 7️⃣ 運用モード設計：ローカル完結 vs API連携
+初回はモデル（約 280MB）が自動ダウンロードされる。2 回目以降はキャッシュから読み込む。
 
-### 🎯 方針
-- **デフォルトは完全ローカルモード**（ネットワーク非依存）。
-- 生成機能は **任意オプション**。
-- ユーザーが明示的に切り替えたときのみAPI通信を許可。
-- すべての送信内容は送信前にプレビュー表示。
+```
+[local-first-rag] Indexing: /path/to/your-rails-app
+  Model:   Xenova/multilingual-e5-base (768dims)
+  DB:      /path/to/your-rails-app/.rag/index.db
+  Git:     enabled
 
-### ⚖️ モード比較表
+[local-first-rag] Done.
+  Added  : 312 files
+  Chunks : 8431
+  DB     : /path/to/your-rails-app/.rag/index.db
+```
 
-| 観点 | 🔒 ローカル完結モード | 🌐 LLM API呼び出しモード |
-|------|----------------------|-------------------------|
-| 目的 | 安全・抽出的 QA | 要約・翻訳・推論など生成的回答 |
-| 処理 | 埋め込み・検索・抜粋整形（抽出的） | 抜粋＋生成（要約・構造化） |
-| 出力 | スニペット＋出典リンク | 自然文＋要約＋出典脚注 |
-| プライバシー | 完全ローカル（ネット不要） | 抜粋を外部送信（マスク可） |
-| コスト | 無料 | トークン課金 |
-| オフライン可否 | ✅ 可 | ❌ 不可 |
-| 幻覚リスク | 極小 | あり（プロンプト設計依存） |
-| 速度 | 高速（端末性能依存） | 遅延あり（API往復） |
-| UI差分 | 出典ビュー中心 | 要約ビュー中心＋費用トースト |
-| ガバナンス | 端末内ポリシーのみ | キー管理／送信監査必須 |
+### 2. サーバー起動
 
+```bash
+pnpm serve --db /path/to/your-rails-app/.rag/index.db
+```
 
+### 3. 検索 UI を開く
 
-### 💡 ローカルモードのリッチ化策
-- 抜粋テンプレ整形（ハイライト／見出し付）
-- 軽量再ランク（ONNX cross-encoder Top-N）
-- 音楽譜面・契約文などドメイン特化辞書
-- 複数抜粋のルール合成（順序＋重複除去）
-- **“半生成”整形** ＝ JSのみで構文補完、創作文なし
+```bash
+pnpm dev
+# → http://localhost:5173 をブラウザで開く
+```
 
-### ✅ 受け入れ基準
-- [ ] Network requests = 0 で検索完結
-- [ ] 出典明示・正確
-- [ ] 100〜300 チャンクで < 300 ms 応答
-- [ ] PII フィルタはローカル実行
-- [ ] APIキーUI OFF 時は送信機能も完全無効化
-
-### 💬 結論
-> 「普段は抽出的・安全に。  
->  必要な時だけ生成的に。」
+接続設定画面でサーバー URL（`http://localhost:3001`）を入力して、検索できる状態になる。
 
 ---
 
-## 8️⃣ 今後のフェーズ
+## CLI オプション
 
-| フェーズ | 内容 |
-|-----------|-------|
-| **RAG 2：検索PoC編** | ベクトル格納と Flat コサイン検索の実装 |
-| **RAG 3：PDF解析編** | PDF→テキスト抽出→チャンク分割→埋め込み |
-| **RAG 4：生成連携（オプション）編** | コンテキスト注入 + LLM API呼び出し（※任意／完全クローズド運用可） |
-| **RAG 5：PWA／設定UI編** | IndexedDB管理、APIキー入力UI、オフライン化 |
+### `pnpm index <rails-root>`
+
+| オプション | 短縮形 | デフォルト | 説明 |
+|-----------|------|----------|------|
+| `--scope` | `-s` | — | 対象ディレクトリをカンマ区切りで指定 |
+| `--exclude` | `-e` | — | 除外ディレクトリをカンマ区切りで追加 |
+| `--db` | — | `<rails-root>/.rag/index.db` | DB ファイルの出力パス |
+
+```bash
+# 特定ディレクトリのみをインデクシング
+pnpm index /path/to/your-rails-app --scope app/models,app/services
+
+# ディレクトリを追加除外
+pnpm index /path/to/your-rails-app --exclude spec,app/assets
+
+# DB の出力先を指定
+pnpm index /path/to/your-rails-app --db ~/rag-indexes/your-rails-app.db
+```
+
+### `pnpm serve`
+
+| オプション | デフォルト | 説明 |
+|-----------|----------|------|
+| `--db` | （必須） | インデックス DB ファイルのパス |
+| `--port` | `3001` | リッスンするポート番号 |
 
 ---
 
-## 🧩 メモ
-- Tailwind v4：CLI分離 + PostCSS別パッケージ
-- pnpm 9〜10 ：approve-builds 仕様変更（対話式）
-- shadcn ：新CLI版へ完全移行
-- WASM transformers：ブラウザ推論が実用域
-- Local-First ＝ 技術＋思想の融合
+## 複数プロジェクトの管理
+
+プロジェクトごとにサーバーを別ポートで起動し、ブラウザのタブで使い分ける。
+
+```bash
+# プロジェクト A
+pnpm serve --db /path/to/app-a/.rag/index.db --port 3001
+
+# プロジェクト B
+pnpm serve --db /path/to/app-b/.rag/index.db --port 3002
+```
 
 ---
 
-✅ **まとめ一句：**
-> RAGをローカルに。  
-> データはあなたの手の中に。  
+## インデクシング対象ファイル
 
+| 種別 | パターン | チャンク粒度 |
+|------|---------|------------|
+| Ruby | `**/*.rb` | クラス概要・メソッド単位 |
+| ERB | `**/*.erb` | ファイル単位 |
+| YAML | `**/*.yml`, `**/*.yaml` | トップキー単位 |
+| Gemfile | `Gemfile` | ファイル全体 |
+
+デフォルトで除外されるディレクトリ: `node_modules`, `.git`, `tmp`, `log`, `vendor/bundle`, `public/assets`, `coverage`, `.bundle`
+
+---
+
+## 技術スタック
+
+| レイヤー | 技術 |
+|---------|------|
+| CLI | Node.js + TypeScript（tsx） |
+| チャンキング | tree-sitter + tree-sitter-ruby |
+| 埋め込みモデル | @xenova/transformers / Xenova/multilingual-e5-base（768dim） |
+| ベクトル DB | better-sqlite3 + sqlite-vec + FTS5 |
+| サーバー | Express |
+| フロントエンド | React + Vite + Tailwind CSS v4 + shadcn/ui |
+| テスト | vitest（178 テスト） |
+
+---
+
+## ライセンス
+
+MIT
