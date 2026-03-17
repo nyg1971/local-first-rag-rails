@@ -163,6 +163,8 @@ export class VectorStore {
         ON method_calls(caller_id);
       CREATE INDEX IF NOT EXISTS idx_assoc_source
         ON associations(source_class);
+      CREATE INDEX IF NOT EXISTS idx_assoc_target
+        ON associations(target);
       CREATE INDEX IF NOT EXISTS idx_chunks_file
         ON chunks(file_path);
       CREATE INDEX IF NOT EXISTS idx_method_defs_file
@@ -415,6 +417,163 @@ export class VectorStore {
     `).all(className) as Array<{ type: string; target: string }>;
 
     return { callers, callees, associations };
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // グラフ拡張用クエリ
+  // ────────────────────────────────────────────────────────────────────
+
+  /**
+   * chunk_id の配列からチャンクを一括取得する。
+   * グラフ拡張で新規に追加するチャンクの取得に使用する。
+   */
+  getChunksByIds(ids: string[]): SearchResult[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT
+        c.id       AS chunk_id,
+        c.file_path,
+        c.start_line,
+        c.end_line,
+        c.type,
+        c.class_name,
+        c.method_name,
+        c.content,
+        c.doc_comment,
+        c.access_modifier,
+        c.git_hash,
+        c.git_message
+      FROM chunks c
+      WHERE c.id IN (${placeholders})
+    `).all(...ids) as Array<{
+      chunk_id: string;
+      file_path: string;
+      start_line: number;
+      end_line: number;
+      type: string;
+      class_name: string | null;
+      method_name: string | null;
+      content: string;
+      doc_comment: string | null;
+      access_modifier: string | null;
+      git_hash: string | null;
+      git_message: string | null;
+    }>;
+
+    return rows.map((r) => ({
+      rowid: 0,
+      chunkId: r.chunk_id,
+      filePath: r.file_path,
+      startLine: r.start_line,
+      endLine: r.end_line,
+      type: r.type,
+      className: r.class_name,
+      methodName: r.method_name,
+      content: r.content,
+      docComment: r.doc_comment,
+      accessModifier: r.access_modifier,
+      distance: 0,
+      gitHash: r.git_hash,
+      gitMessage: r.git_message,
+    }));
+  }
+
+  /**
+   * className を起点にアソシエーション先クラスのチャンク ID を返す。
+   * include / extend / prepend の対象が汎用 Concern（多数クラスから include される）の場合は除外する。
+   */
+  getAssociatedChunkIds(
+    className: string,
+    includeCountThreshold = 10,
+  ): Array<{ chunkId: string; type: string }> {
+    const assocRows = this.db.prepare(`
+      SELECT type, target FROM associations WHERE source_class = ?
+    `).all(className) as Array<{ type: string; target: string }>;
+
+    const result: Array<{ chunkId: string; type: string }> = [];
+
+    for (const assoc of assocRows) {
+      // include / extend / prepend は汎用 Concern を除外
+      if (assoc.type === 'include' || assoc.type === 'extend' || assoc.type === 'prepend') {
+        const countRow = this.db.prepare(`
+          SELECT COUNT(DISTINCT source_class) AS cnt
+          FROM associations WHERE type = 'include' AND target = ?
+        `).get(assoc.target) as { cnt: number };
+        if (countRow.cnt > includeCountThreshold) continue;
+      }
+
+      // target クラス / モジュールの概要チャンクを取得
+      const chunkRows = this.db.prepare(`
+        SELECT id FROM chunks WHERE class_name = ? AND type IN ('class', 'module')
+      `).all(assoc.target) as Array<{ id: string }>;
+
+      for (const c of chunkRows) {
+        result.push({ chunkId: c.id, type: assoc.type });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * className#methodName を呼び出しているチャンクの ID を返す（callers）。
+   */
+  getCallerChunkIds(className: string, methodName: string): string[] {
+    const callerRows = this.db.prepare(`
+      SELECT DISTINCT caller_id FROM method_calls
+      WHERE callee_raw LIKE ?
+      LIMIT 50
+    `).all(`%${methodName}%`) as Array<{ caller_id: string }>;
+
+    const chunkIds: string[] = [];
+    for (const { caller_id } of callerRows) {
+      // caller_id 形式: "ClassName#method"（インスタンス）または "ClassName.method"（クラス）
+      const sepIdx = caller_id.includes('#')
+        ? caller_id.lastIndexOf('#')
+        : caller_id.lastIndexOf('.');
+      if (sepIdx === -1) continue;
+      const callerClass = caller_id.slice(0, sepIdx);
+      const callerMethod = caller_id.slice(sepIdx + 1);
+
+      const chunks = this.db.prepare(`
+        SELECT id FROM chunks WHERE class_name = ? AND method_name = ?
+      `).all(callerClass, callerMethod) as Array<{ id: string }>;
+
+      chunkIds.push(...chunks.map((c) => c.id));
+    }
+
+    return [...new Set(chunkIds)];
+  }
+
+  /**
+   * className#methodName が呼び出しているチャンクの ID を返す（callees）。
+   * 定数レシーバー（大文字始まりのクラス名.メソッド名）のみを対象とする。
+   */
+  getCalleeConstantChunkIds(className: string, methodName: string): string[] {
+    const callerIds = [`${className}#${methodName}`, `${className}.${methodName}`];
+    const placeholders = callerIds.map(() => '?').join(',');
+
+    const calleeRows = this.db.prepare(`
+      SELECT DISTINCT callee_raw FROM method_calls
+      WHERE caller_id IN (${placeholders})
+    `).all(...callerIds) as Array<{ callee_raw: string }>;
+
+    const chunkIds: string[] = [];
+    for (const { callee_raw } of calleeRows) {
+      // 定数レシーバー: "ClassName.method" 形式（大文字始まり）
+      const match = /^([A-Z][A-Za-z0-9_]*)\./.exec(callee_raw);
+      if (!match) continue;
+      const receiverClass = match[1];
+
+      const chunks = this.db.prepare(`
+        SELECT id FROM chunks WHERE class_name = ? AND type IN ('class', 'module')
+      `).all(receiverClass) as Array<{ id: string }>;
+
+      chunkIds.push(...chunks.map((c) => c.id));
+    }
+
+    return [...new Set(chunkIds)];
   }
 
   // ────────────────────────────────────────────────────────────────────
