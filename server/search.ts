@@ -5,6 +5,28 @@ import type { VectorStore, SearchResult } from '../cli/store.ts';
 const TOP_K = 20; // 各検索で取得する件数
 const RRF_K = 60; // RRF定数（一般的な推奨値）
 
+// ハブノード（展開起点から除外する Rails 基底クラス）
+const HUB_CLASS_NAMES = new Set([
+  'ApplicationRecord',
+  'ApplicationController',
+  'ApplicationJob',
+  'ApplicationMailer',
+  'ApplicationHelper',
+]);
+
+// 関係種別ごとの減衰率
+const DECAY_RATES: Record<string, number> = {
+  has_many:                  0.6,
+  belongs_to:                0.6,
+  has_one:                   0.6,
+  has_and_belongs_to_many:   0.6,
+  callers:                   0.5,
+  include:                   0.4,
+  extend:                    0.4,
+  prepend:                   0.4,
+  callees:                   0.3,
+};
+
 export interface HybridResult {
   chunkId: string;
   filePath: string;
@@ -59,9 +81,12 @@ export function createSearchHandler(store: VectorStore) {
 
       // ── 3. RRF スコア統合 ──────────────────────────────────────
       const merged = reciprocalRankFusion(vecResults, ftsResults, RRF_K);
-      const topResults = merged.slice(0, topK);
 
-      // ── 4. 参照情報付与 ──────────────────────────────────────
+      // ── 4. グラフ拡張・再ランキング ──────────────────────────────────────
+      const expanded = expandByGraph(merged, store, topK);
+      const topResults = expanded.slice(0, topK);
+
+      // ── 5. 参照情報付与 ──────────────────────────────────────
       const results: HybridResult[] = topResults.map((r) => {
         const base: HybridResult = {
           chunkId: r.chunkId,
@@ -139,6 +164,86 @@ export function reciprocalRankFusion(
   });
 
   return [...scores.values()].sort((a, b) => b.rrfScore - a.rrfScore);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// グラフ拡張・再ランキング
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * RRF 結果の上位 topK チャンクを起点に参照テーブルを辿り、
+ * 関連チャンクを取得してスコアを付与したうえで再ランキングする。
+ *
+ * - ハブノード（ApplicationRecord 等）は展開起点から除外
+ * - include/extend/prepend の汎用 Concern は store 側で除外
+ * - 重複チャンクはスコアを加算
+ */
+export function expandByGraph(
+  initialResults: RankedResult[],
+  store: VectorStore,
+  topK: number,
+): RankedResult[] {
+  // scoreMap: chunkId → RankedResult（スコアを上書き可能なコピー）
+  const scoreMap = new Map<string, RankedResult>();
+  for (const r of initialResults) {
+    scoreMap.set(r.chunkId, { ...r });
+  }
+
+  // 追加スコアを集積: chunkId → 合計加算スコア
+  const addedScores = new Map<string, number>();
+
+  const seeds = initialResults.slice(0, topK);
+
+  for (const seed of seeds) {
+    if (!seed.className) continue;
+    if (HUB_CLASS_NAMES.has(seed.className)) continue;
+
+    // アソシエーション展開（has_many / belongs_to / include 等）
+    for (const { chunkId, type } of store.getAssociatedChunkIds(seed.className)) {
+      if (chunkId === seed.chunkId) continue;
+      const decay = DECAY_RATES[type] ?? 0.3;
+      addedScores.set(chunkId, (addedScores.get(chunkId) ?? 0) + seed.rrfScore * decay);
+    }
+
+    if (seed.methodName) {
+      // Callers 展開（このメソッドを呼び出しているチャンク）
+      for (const chunkId of store.getCallerChunkIds(seed.className, seed.methodName)) {
+        if (chunkId === seed.chunkId) continue;
+        addedScores.set(
+          chunkId,
+          (addedScores.get(chunkId) ?? 0) + seed.rrfScore * DECAY_RATES.callers,
+        );
+      }
+
+      // Callees 展開（定数レシーバーのみ）
+      for (const chunkId of store.getCalleeConstantChunkIds(seed.className, seed.methodName)) {
+        if (chunkId === seed.chunkId) continue;
+        addedScores.set(
+          chunkId,
+          (addedScores.get(chunkId) ?? 0) + seed.rrfScore * DECAY_RATES.callees,
+        );
+      }
+    }
+  }
+
+  // 新規チャンク（初期結果に含まれないもの）を DB から取得して scoreMap に追加
+  const newIds = [...addedScores.keys()].filter((id) => !scoreMap.has(id));
+  for (const chunk of store.getChunksByIds(newIds)) {
+    scoreMap.set(chunk.chunkId, {
+      ...chunk,
+      rrfScore: 0,
+      vectorDistance: null,
+      ftsScore: null,
+    });
+  }
+
+  // スコア加算（既存・新規問わず）
+  for (const [chunkId, addedScore] of addedScores.entries()) {
+    const entry = scoreMap.get(chunkId);
+    if (entry) entry.rrfScore += addedScore;
+  }
+
+  return [...scoreMap.values()].sort((a, b) => b.rrfScore - a.rrfScore);
 }
 
 // ────────────────────────────────────────────────────────────────────
