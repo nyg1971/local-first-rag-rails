@@ -1,12 +1,20 @@
-# local-first-rag-Poc
+# local-first-rag (PoC)
 
 Rails コードベースを、ローカルで RAG 検索できる開発者向けツールのPoC。
 
-*現在は、検索精度の向上が課題
+> 現在は、検索精度の向上が課題（再ランキング）
 
 Tree-sitter による AST ベースのチャンキングと、ベクトル検索 + 全文検索のハイブリッド方式で、Rails リポジトリのコードを自然言語で検索する。
 
 ---
+
+## デモ
+
+RAGサーバーに接続 → 自然言語で検索 → 結果表示
+
+<video src="https://github.com/user-attachments/assets/a1d6152b-85ee-4caa-8776-39950b8cdade" width="80%" controls></video>
+
+----
 
 ## 特徴
 
